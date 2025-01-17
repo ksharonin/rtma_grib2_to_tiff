@@ -1,6 +1,7 @@
 #!/usr/bin/env python3.13
 
-import traceback
+import rasterio
+import glob
 import os
 from osgeo import gdal
 import cfgrib
@@ -8,13 +9,15 @@ import boto3
 import pygrib
 from botocore import UNSIGNED
 from botocore.config import Config
+from validation import validate_band_values, validate_spatial_match, extract_timestamp
 
 # Suppress PROJ warning
 os.environ['PROJ_LIB'] = '/opt/homebrew/share/proj'
 
 # Settings
-DATE = "20250107" # Format as: YYYYMMDD
+DATE = "20250108" # Format as: YYYYMMDD
 TIME_STEP_MINUTES = 60 # starting at 0000, control timestep of band sampling
+# Band 8: WindDir, Band 9: WindSpeed 
 BAND_NUMBER = 9
 
 # e.g. Want to target file(s) in s3://noaa-rtma-pds/rtma2p5_ru.20250107/rtma2p5_ru.t0000z.2dvaranl_ndfd.grb2 
@@ -28,7 +31,7 @@ DEBUG_DOWNLOADED_FILES = True # keeps downloaded files from AWS, otherwise delet
 # refactor to use dynamic paths picked up from script
 DOWNLOAD_LOCATION_PATH = "/Users/katrinasharonin/Downloads/firelab_work/grib2_to_tiff/input/"
 OUTPUT_DIR_PATH = "/Users/katrinasharonin/Downloads/firelab_work/grib2_to_tiff/output/"
-OUTPUT_FILE_PATH = "/Users/katrinasharonin/Downloads/firelab_work/grib2_to_tiff/output/rtma2p5_ru.t2245z.2dvaranl_ndfd.tiff"
+OUTPUT_FILE_PATH = f"/Users/katrinasharonin/Downloads/firelab_work/grib2_to_tiff/output/{DATE}_ws_merged.tiff"
 
 
 def read_grib2_band(
@@ -39,102 +42,57 @@ def read_grib2_band(
     return grib_data[band_name]
 
 def merge_bands(
-    directory_path: str,
-    output_file_path: str,
-    target_band_number: int,
-):
-    """
-    Merge specific bands from multiple GRIB2 files with enhanced error handling and debugging.
-    
-    Args:
-        directory_path: Path to directory containing GRIB2 files
-        output_file_path: Path for output merged file
-        target_band_number: The band number to extract from each file
-    """
-    input_files = [
-        os.path.join(directory_path, entry)
-        for entry in os.listdir(directory_path)
-        if os.path.isfile(os.path.join(directory_path, entry))
-        and entry.endswith('.grb2')
-    ]
-    
-    if not input_files:
-        raise ValueError(f"No .grb2 files found in {directory_path}")
+        date: str,
+        directory_path: str, 
+        output_file_path: str, 
+        target_band_number: int
+    ):
+
+    print(f"Starting band merge process for band {target_band_number}")
     
     try:
-        messages = []
-        for file_path in input_files:
-            try:
-                grbs = pygrib.open(file_path)
-                
-                print(f"\nProcessing file: {file_path}")
-                print("Available messages:")
-                for i, grb in enumerate(grbs, 1):
-                    print(f"Message {i}: {grb.shortName} {grb.typeOfLevel} {grb.level}")
-                
-                # Reset file pointer
-                grbs.seek(0)
-                message = grbs.message(target_band_number)
-                
-                messages.append(message)
-                grbs.close()
-                print(f"\033[32mExtracted band {target_band_number} from {os.path.basename(file_path)}\033[0m")
-                
-            except Exception as e:
-                print(f"\033[31mError processing {file_path}: {str(e)}\033[0m")
-                continue
+        grib_files = glob.glob(os.path.join(directory_path, "*.grb2"))
+        grib_files = [entry for entry in grib_files if date in entry]
+        if not grib_files:
+            print(f"No .grb2 files found in {directory_path} with matching date")
+            return
+            
+        # Sort files for earliest timestamp first
+        grib_files.sort(key=lambda x: extract_timestamp(os.path.basename(x)))
         
-        if not messages:
-            raise ValueError("No valid messages were extracted from any files")
-        
-        # Verify same structure
-        first_msg = messages[0]
-        reference_keys = set(first_msg.keys())
-        
-        for i, msg in enumerate(messages[1:], 2):
-            current_keys = set(msg.keys())
-            if current_keys != reference_keys:
-                missing_keys = reference_keys - current_keys
-                extra_keys = current_keys - reference_keys
-                print(f"\033[33mWarning: Message {i} has different keys:")
-                if missing_keys:
-                    print(f"Missing keys: {missing_keys}")
-                if extra_keys:
-                    print(f"Extra keys: {extra_keys}\033[0m")
-        
-        # Write messages using a binary approach
-        with open(output_file_path, 'wb') as out:
-            for msg in messages:
-                valid_keys = []
-                for key in msg.keys():
-                    try:
-                        value = msg[key]
-                        if value:
-                            valid_keys.append(key)
-                    except Exception as e:
-                        print(f"Skipping key {key} due to missing/invalid value: {e}")
-
-                # See https://github.com/jswhit/pygrib/issues/177#issuecomment-768520311
-                pygrib.tolerate_badgrib_on()
-
+        with open(output_file_path, 'wb') as outfile:
+            for grib_path in grib_files:
                 try:
-                    msg.tofile(out)
+                    pygrib.tolerate_badgrib_on()
+
+                    with pygrib.open(grib_path) as grbs:
+
+                        messages = list(grbs)
+                        
+                        if target_band_number > len(messages):
+                            print(f"Target band {target_band_number} exceeds number of bands in {grib_path}")
+                            continue
+                            
+                        # Fetch band, -1 due to 0 indexing in python
+                        target_msg = messages[target_band_number - 1]
+                        
+                        if target_msg is None:
+                            print(f"Could not read band {target_band_number} from {grib_path}")
+                            continue
+                            
+                        outfile.write(target_msg.tostring())
+                        time = extract_timestamp(os.path.basename(grib_path))
+                        print(f"Successfully processed band {target_band_number} from timestamp {time:04d}")
+                        
                 except Exception as e:
-                    print(f"\033[31mError writing message: {str(e)}")
-                    print(f"Message details: {msg.shortName} {msg.typeOfLevel} {msg.level}\033[0m")
-                    print(traceback.format_exc())
-                    raise
-        
-        # Verify output file
-        verify_grb = pygrib.open(output_file_path)
-        msg_count = len([msg for msg in verify_grb])
-        verify_grb.close()
-        print(f"\033[32mVerification: Output file contains {msg_count} messages\033[0m")
+                    print(f"Error processing file {grib_path}: {str(e)}")
+                    continue
+                    
+        return os.path.exists(output_file_path) and os.path.getsize(output_file_path) > 0
         
     except Exception as e:
-        print(f"\033[31mError occurred while merging files: {str(e)}\033[0m")
-        raise
-
+        print(f"Fatal error in merge_bands: {str(e)}")
+        return False
 
 def download_from_s3(
     bucket_name: str,
@@ -171,7 +129,7 @@ def download_grib_files(
             print("\033[31mIllegal new_minutes value, cannot be 60+ and got %i \033[0m" % new_minutes)
             break
 
-        output_path = output_directory + AWS_PREFIX + ".t" + f"{current:04d}" + "z." + AWS_POSTFIX
+        output_path = output_directory + date + "_" + AWS_PREFIX + ".t" + f"{current:04d}" + "z." + AWS_POSTFIX
         key = master_key + "/" + AWS_PREFIX + ".t" + f"{current:04d}" + "z." + AWS_POSTFIX
 
         print("Attempting to download file key %s from bucket %s" % (key, AWS_BUCKET_NAME))
@@ -217,8 +175,7 @@ def grib2_to_tiff(
     assert input_num_bands == output_num_bands, "Got mismatching band count: saw %i bands in GRIB2, got %i bands in TIFF" % (input_num_bands, output_num_bands)
 
     print("\nDone! Check %s for output TIFF\n" % output_file_path)
-
-
+    
 def main():
 
     # Set up directories
@@ -241,13 +198,13 @@ def main():
         output_directory=DOWNLOAD_LOCATION_PATH,
     )
 
-    # Verification
-    num_files = len([entry for entry in os.listdir(DOWNLOAD_LOCATION_PATH) if os.path.isfile(os.path.join(DOWNLOAD_LOCATION_PATH, entry))])
+    num_files = len([entry for entry in os.listdir(DOWNLOAD_LOCATION_PATH) if os.path.isfile(os.path.join(DOWNLOAD_LOCATION_PATH, entry)) and ".grb2" in entry and DATE in entry])
     assert num_keys == num_files, "Invalid number of downloaded files: expected %i, got %i" % (num_keys, num_files)
 
     # Extract and consolidate all bands into new GRIB
-    merged_file_name = OUTPUT_DIR_PATH + DATE + "_" + str(BAND_NUMBER) + "_MERGED.grb2"
+    merged_file_name = OUTPUT_DIR_PATH + DATE + "_BAND_" + str(BAND_NUMBER) + "_MERGED.grb2"
     merge_bands(
+        date=DATE,
         directory_path=DOWNLOAD_LOCATION_PATH,
         output_file_path=merged_file_name,
         target_band_number=BAND_NUMBER,
@@ -255,6 +212,23 @@ def main():
 
     # Convert merged grib into tiff
     grib2_to_tiff(input_file_path=merged_file_name, output_file_path=OUTPUT_FILE_PATH)
+
+    # Verification
+    success = validate_band_values(
+        date=DATE,
+        grib_directory=DOWNLOAD_LOCATION_PATH,
+        tiff_path=OUTPUT_FILE_PATH,
+        grib_band=BAND_NUMBER
+    )
+
+    success = validate_spatial_match(
+        date=DATE,
+        tiff_path=OUTPUT_FILE_PATH,
+        grib_directory=DOWNLOAD_LOCATION_PATH,
+        target_band_number=BAND_NUMBER
+    )
+
+    assert success, "Failed to verify contents of TIFF"
 
     return 0
 
